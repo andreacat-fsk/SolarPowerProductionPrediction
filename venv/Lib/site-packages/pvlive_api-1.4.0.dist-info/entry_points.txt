@@ -1,0 +1,2 @@
+[console_scripts]
+pv_live = pvlive_api.pvlive:main
