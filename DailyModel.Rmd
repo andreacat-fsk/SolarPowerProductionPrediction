@@ -1,0 +1,1264 @@
+---
+title: "Daily Prediction Model"
+author: "Andrea Catucci"
+date: "2025-04-22"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(MASS)
+library(dplyr)
+library(readxl)
+library(sf)
+library(terra)
+library(spData)
+library(spDataLarge)
+library(tmap) 
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+library(lme4)
+library(lmerTest)
+library(Metrics)
+library(zoo)
+library(car)
+library(purrr)
+library(broom)
+library(gstat)
+library(sp)
+library(spacetime)
+```
+
+# Daily Model for Solar Power Generation
+
+## Load Data
+
+### *Weather Data*
+```{r weather}
+d_weather_2024 <- read.csv("C:\\Users\\Utente\\Desktop\\Research\\data\\daily_20_24\\midas_wxdrnl_202401-202412.txt", header=F)
+colsnames <- c(
+  "OB_END_TIME", "ID", "ID_TYPE", "OB_HOUR_COUNT", "VERSION_NUM", "MET_DOMAIN_NAME",
+  "src_id", "REC_ST_IND", "CS_24HR_SUN_DUR", "CONC_STATE_ID", "LYING_SNOW_FLAG",
+  "SNOW_DEPTH", "FRSH_SNOW_AMT", "SNOW_DAY_ID", "HAIL_DAY_ID", "THUNDER_DAY_FLAG",
+  "GALE_DAY_FLAG", "FRSH_MNT_SNWFALL_FLAG", "WMO_24HR_SUN_DUR", "CS_24HR_SUN_DUR_Q",
+  "CONC_STATE_ID_Q", "SNOW_DEPTH_Q", "FRSH_SNW_AMT_Q", "SNOW_DAY_ID_Q", "HAIL_DAY_ID_Q",
+  "THUNDER_DAY_FLAG_Q", "GALE_DAY_FLAG_Q", "WMO_24HR_SUN_DUR_Q", "METO_STMP_TIME",
+  "MIDAS_STMP_ETIME", "DRV_24HR_SUN_DUR", "DRV_24HR_SUN_DUR_Q", "LYING_SNOW_HT",
+  "LYING_SNOW_HT_Q"
+)
+colnames(d_weather_2024) <- colsnames
+```
+
+### Add coordinates to weather stations
+
+```{r coords}
+all_stations <- read.delim(
+  "C:/Users/Utente/Desktop/Research/data/daily_20_24/excel_list_station_details.txt",
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  fileEncoding = "UTF-8"
+)
+
+all_stations <- all_stations %>%
+  select(src_id, Latitude, Longitude)
+
+weather <- d_weather_2024 %>%
+  left_join(all_stations, by="src_id")
+```
+
+### Visualize weather stations on UK map
+
+```{r vis}
+data(world)
+uk <- world[world$name_long == "United Kingdom", ]
+
+all_stations_sf <- st_as_sf(all_stations, coords = c("Longitude", "Latitude"), crs = 4326)
+
+tm_shape(uk) +
+  tm_polygons() +
+  tm_shape(all_stations_sf) +
+  tm_dots(fill = "blue", size = 0.1)
+```
+
+### Select weather stations that have data on sunshine duration.
+
+#### In our dataset, there are three measurements of sunshine duration:
+* *cs_24hr_sun_dur*: Campbell-Stokes sunshine duration (0.1 hours). It uses an instrument that has a mounted glass sphere which focuses the suns rays onto a thick card, burning a hole when the sun is shining. The passage of the sun across the sky translates into a linear burn pattern along the card which may be analysed by the observer to give measurements of sunshine duration. Sources of error are poor exposure, poor maintainance (dirt/ice on the glass), poor levelling of the frame, over records on days of broken clouds (up to 20% systematic error), vandalism.
+* *drv_24hr_sun_dur*: radiation sensors only which use the global radiation values to derive a 24hr sunshine value. This was incorrectly appearing under WMO 24hr sunshine when the value was not coming from a sunshine sensor so was moved into the DRV_24HR_SUN_DUR column.
+* *wmo_24hr_sun_dur*.
+
+#### We select weather stations that have at least one of these variables non-NA.
+
+```{r select, results=FALSE}
+sub1_weather <- weather[!is.na(weather$DRV_24HR_SUN_DUR),]
+sub2_weather <- weather[!is.na(weather$WMO_24HR_SUN_DUR),]
+sub3_weather <- weather[!is.na(weather$CS_24HR_SUN_DUR),]
+joined_weather <- sub1_weather %>%
+  full_join(sub2_weather) %>%
+  full_join(sub3_weather) %>% 
+  filter(src_id != 1585 & src_id != 1588 & src_id != 1605 & src_id != 1609) #we get rid of some UK weather stations far from the main island.
+locations <- data.frame(
+  src_id = c(1046, 1572, 1575, 17091, 17094,17097, 24089, 25727, 62319),
+  Latitude = c(54.08507, 49.432, 49.208, 51.84897, 52.699, 53.433, 53.30002, 50.89182, 50.80734),
+  Longitude = c(-4.6307, -2.598, 2.196, -8.483, -8.91603, -6.25007, -6.39999, -1.39361, -4.30857)
+)
+
+for (i in 1:nrow(locations)){
+  id <- locations$src_id[i]
+  joined_weather[joined_weather$src_id == id, "Latitude"] <- locations$Latitude[i]
+  joined_weather[joined_weather$src_id == id, "Longitude"] <- locations$Longitude[i]
+}
+
+#Now we plot the stations that appear in this new joined dataset
+joined_stations <- joined_weather %>%
+  select(src_id, Latitude, Longitude) %>%
+  distinct()
+```
+
+#### Plotting stations of interest and all stations together
+
+```{r together}
+joined_stations_sf <- st_as_sf(joined_stations, coords = c("Longitude", "Latitude"), crs = 4326)
+
+tm_shape(uk) +
+  tm_polygons() +
+  tm_shape(all_stations_sf) +
+  tm_dots(fill = "blue", size = 0.1) +
+  tm_shape(joined_stations_sf) +
+  tm_dots(fill = "red", size = 0.2) 
+```
+
+#### So our weather stations of interest seem to be well scattered around the map.
+
+#### Before moving into the model, we want to aggregate the sunshine duration variables into one single column variable.
+
+#### Before that, lets select only the columns we are interested in for our modelling.
+
+```{r selection}
+selected_weather <- joined_weather %>%
+  select(OB_END_TIME, VERSION_NUM, src_id, CS_24HR_SUN_DUR, WMO_24HR_SUN_DUR, DRV_24HR_SUN_DUR, Latitude, Longitude)
+```
+
+#### Our new *SUNSHINE_DUR* variable gets the following values:
++ cs_24hr_sun_dur when not NA.
++ drv_24hr_sun_dur when not NA and wmo_24hr_sun_dur is NA.
++ wmo_24hr_sun_dur when not NA and drv_24hr_sun_dur is NA.
++ (drv_24hr_sun_dur+wmo_24hr_sun_dur)/2 when both are not NA.
+
+```{r new_var}
+selected_weather <- selected_weather %>%
+  mutate(
+    SUNSHINE_DUR = case_when(
+      !is.na(CS_24HR_SUN_DUR) ~ CS_24HR_SUN_DUR,
+      is.na(WMO_24HR_SUN_DUR) & !is.na(DRV_24HR_SUN_DUR) ~ DRV_24HR_SUN_DUR,
+      is.na(DRV_24HR_SUN_DUR) & !is.na(WMO_24HR_SUN_DUR) ~ WMO_24HR_SUN_DUR,
+      !is.na(DRV_24HR_SUN_DUR) & !is.na(WMO_24HR_SUN_DUR) ~ 
+        (DRV_24HR_SUN_DUR + WMO_24HR_SUN_DUR) / 2,
+      TRUE ~ NA_real_ 
+    )
+  ) %>% 
+  select(!c(CS_24HR_SUN_DUR, WMO_24HR_SUN_DUR, DRV_24HR_SUN_DUR))
+```
+
+#### We are also interested in knowing how much missing data we have (for each day, how many stations do not have a row of observations)
+
+```{r missing}
+min_date <- min(as.Date(selected_weather$OB_END_TIME))
+max_date <- max(as.Date(selected_weather$OB_END_TIME))
+all_dates <- expand.grid(
+  src_id = unique(selected_weather$src_id),
+  OB_DATE = seq(min_date, max_date, by = "day")
+)
+selected_weather <- selected_weather %>%
+  mutate(OB_DATE = as.Date(OB_END_TIME))
+missing_days <- all_dates %>%
+  anti_join(selected_weather %>% select(src_id, OB_DATE), by = c("src_id", "OB_DATE"))
+missing_days %>%
+  count(src_id, name = "missing_days") %>%
+  arrange(desc(missing_days))
+```
+
+### **Do we get rid of stations with lots of missing data? How to deal with the rest of the stations with few missing data points?**
+#### In this case, since we average the sunshine duration for the whole region, we use all available data points in a single day for that region, to not lose any data.
+#### When we will work with gsp's, we might need another approach.
+
+#### The following is a plot of stations (red) that have all days of data available vs those that do not (blue).
+```{r complete}
+complete_stations <- joined_stations[!(joined_stations$src_id %in% missing_days$src_id),]
+complete_stations_sf <- st_as_sf(complete_stations,coords = c("Longitude", "Latitude"), crs = 4326)
+#Plot of stations with all data points
+
+tm_shape(uk) +
+  tm_polygons() +
+  tm_shape(joined_stations_sf) +
+  tm_dots(fill = "blue", size = 0.1) +
+  tm_shape(complete_stations_sf) +
+  tm_dots(fill = "red", size = 0.2) 
+```
+
+#### In the meantime, we move onto our target variable and preparing the data for the model.
+
+### *Solar Power Generation Data*
+
+#### We also import spatial boundaries for the PES regions.
+```{r gen}
+gen_data <- read.csv("C:\\Users\\Utente\\Desktop\\Research\\data\\daily_pv_generation.csv", header = T, sep = ",")
+gen_data$pes_id <- as.character(gen_data$pes_id)
+gen_data$date <- as.Date(gen_data$date)
+
+gj_boundaries <- "C:\\Users\\Utente\\Desktop\\Research\\data\\gb-dno-license-areas-20240503-as-geojson.geojson"
+boundaries = sf::st_read(gj_boundaries)
+boundaries$ID <- as.character(boundaries$ID)
+
+tm_shape(boundaries) +
+  tm_polygons(fill = "ID", fill_alpha = 0.5) +
+  tm_text("ID", size = 0.4) +
+  tm_title("DNO License Areas") +
+  tm_shape(joined_stations_sf) +
+  tm_dots(fill = "red", size = 0.2) 
+```
+
+#### We also import data on capacity.
+#### This data is at a GSP level, so we aggregate it to get a PES capacity variable, which will be useful in our prediction model.
+
+```{r capacity}
+capacity_by_gsp <- read.csv("C:\\Users\\Utente\\Desktop\\Research\\data\\capacity_by_gsp.csv")
+
+gsp_location <- read.csv("C:\\Users\\Utente\\Desktop\\Research\\gsp_gnode_directconnect_region_lookup.csv")
+
+colnames(capacity_by_gsp)[which(names(capacity_by_gsp) == "GSPs")] <- "gsp_name"
+
+capacity_by_gsp$gsp_name <- sub("\\|.*", "", capacity_by_gsp$gsp_name)
+
+capacity_by_gsp_with_location <- gsp_location %>%
+  left_join(capacity_by_gsp, by = "gsp_name")
+
+unassigned_capacity <- gsp_location %>%
+  right_join(capacity_by_gsp, by = "gsp_name") %>%
+  filter(is.na(pes_id)) %>%
+  select(gsp_name, dc_capacity_mwp)
+
+unassigned_capacity #we add this manually 
+add_17 = 11.674539 + 19.644233 + 1.387980
+add_12 = 15.568655
+add_23 = 50.426981
+add_18 = 5.386124
+
+capacity_by_pes <- capacity_by_gsp_with_location %>%
+  group_by(pes_id) %>%
+  summarise(capacity_mwh = sum(dc_capacity_mwp, na.rm=TRUE)) %>%
+  ungroup() %>%
+  filter(!is.na(pes_id)) %>%
+  setNames(c("ID", "capacity"))
+
+capacity_by_pes[capacity_by_pes$ID==18,"capacity"] <- capacity_by_pes[capacity_by_pes$ID==18,"capacity"] + add_18
+capacity_by_pes[capacity_by_pes$ID==12,"capacity"] <- capacity_by_pes[capacity_by_pes$ID==12,"capacity"] + add_12
+capacity_by_pes[capacity_by_pes$ID==17,"capacity"] <- capacity_by_pes[capacity_by_pes$ID==17,"capacity"] + add_17
+capacity_by_pes[capacity_by_pes$ID==23,"capacity"] <- capacity_by_pes[capacity_by_pes$ID==23,"capacity"] + add_23
+
+
+capacity_by_pes$ID <- as.character(capacity_by_pes$ID)
+
+boundaries_with_capacity <- boundaries %>%
+  left_join(capacity_by_pes, by="ID")
+
+capacity_by_pes <- capacity_by_pes %>%
+    setNames(c("pes_id", "capacity_mwh"))
+
+tm_shape(boundaries_with_capacity) +
+  tm_polygons(fill = "capacity", fill_alpha = 0.5) +
+  tm_text("ID", size = 0.4) +
+  tm_title("DNO License Areas") +
+  tm_shape(joined_stations_sf) +
+  tm_dots(fill = "red", size = 0.2)
+```
+
+###### Plot of capacity per each PES region.
+
+#### Now, we have all our data. We need to create the final dataset for modelling.
+
+### Dataset structure:
+### Lattice data (UK divided into PES regions) with daily solar power generation (target), maximum capacity of region (covariate), average daily sunshine duration (covariate) throughout the region, and of course adjacency of regions. Every variable is observed daily.
+
+#### View of our data to merge into one: 
+
+```{r view}
+head(gen_data)
+head(selected_weather)
+head(boundaries_with_capacity)
+```
+
+#### Start by averaging sunshine duration for the regions.
+
+```{r mod}
+weather_sf <- st_as_sf(selected_weather, coords = c("Longitude", "Latitude"), crs = 4326) 
+weather_sf <- st_transform(weather_sf, crs = st_crs(boundaries_with_capacity)) 
+weather_with_id <- st_join(weather_sf, boundaries_with_capacity[, c("ID")]) %>%
+  st_drop_geometry() %>%
+  na.omit() %>% #removes weather stations in the Ocean 
+  summarise(avg_sun = mean(SUNSHINE_DUR), .by=c(ID, OB_END_TIME)) #alternative is block kriging
+```
+
+#### There are no weather stations in the region 12, the smallest one.
+#### We thus estimate sunshine duration in region 12 by averaging the value for the 4 closest weather stations to its centroid.
+
+```{r mod2}
+region_12_geom <- boundaries_with_capacity %>% filter(ID == 12)
+weather_sf$distance_to_12 <- st_distance(weather_sf, st_centroid(region_12_geom)) %>% as.numeric()
+
+weather_near_12 <- weather_sf %>%
+  group_by(OB_END_TIME) %>%
+  arrange(distance_to_12) %>%
+  slice_head(n = 4) %>% 
+  summarise(avg_sun = mean(SUNSHINE_DUR, na.rm = TRUE), .groups = "drop") %>%
+  mutate(ID = 12)  
+weather_near_12$ID <- as.character(weather_near_12$ID)
+weather <- bind_rows(weather_with_id, weather_near_12) %>%
+  mutate(date = as.Date(OB_END_TIME), .before = ID) %>%
+  arrange(date, ID) %>%
+  dplyr::select(-OB_END_TIME) %>%
+  setNames(c("date", "pes_id", "sun_duration")) %>%
+  select(date, pes_id, sun_duration)
+```
+
+#### Now, we want to join the solar power generation data to this spatio-temporal dataset, and the capacity data.
+
+
+```{r final_data}
+data <- gen_data %>%
+  full_join(weather, by=c("pes_id", "date")) %>%
+  left_join(capacity_by_pes, by="pes_id") 
+summary(data)
+```
+
+#### We use the same process to obtain ready-to-use test data
+
+```{r testdata, include=F, echo=F}
+d_weather_2023_test <- read.csv("C:\\Users\\Utente\\Desktop\\Research\\data\\daily_20_24\\midas_wxdrnl_202301-202312.txt", header=F)
+colsnames <- c(
+  "OB_END_TIME", "ID", "ID_TYPE", "OB_HOUR_COUNT", "VERSION_NUM", "MET_DOMAIN_NAME",
+  "src_id", "REC_ST_IND", "CS_24HR_SUN_DUR", "CONC_STATE_ID", "LYING_SNOW_FLAG",
+  "SNOW_DEPTH", "FRSH_SNOW_AMT", "SNOW_DAY_ID", "HAIL_DAY_ID", "THUNDER_DAY_FLAG",
+  "GALE_DAY_FLAG", "FRSH_MNT_SNWFALL_FLAG", "WMO_24HR_SUN_DUR", "CS_24HR_SUN_DUR_Q",
+  "CONC_STATE_ID_Q", "SNOW_DEPTH_Q", "FRSH_SNW_AMT_Q", "SNOW_DAY_ID_Q", "HAIL_DAY_ID_Q",
+  "THUNDER_DAY_FLAG_Q", "GALE_DAY_FLAG_Q", "WMO_24HR_SUN_DUR_Q", "METO_STMP_TIME",
+  "MIDAS_STMP_ETIME", "DRV_24HR_SUN_DUR", "DRV_24HR_SUN_DUR_Q", "LYING_SNOW_HT",
+  "LYING_SNOW_HT_Q"
+)
+colnames(d_weather_2023_test) <- colsnames
+
+test_weather <- d_weather_2023_test %>%
+  left_join(all_stations, by="src_id")
+
+test_sub1_weather <- test_weather[!is.na(test_weather$DRV_24HR_SUN_DUR),]
+test_sub2_weather <- test_weather[!is.na(test_weather$WMO_24HR_SUN_DUR),]
+test_sub3_weather <- test_weather[!is.na(test_weather$CS_24HR_SUN_DUR),]
+
+test_joined_weather <- test_sub1_weather %>%
+  full_join(test_sub2_weather) %>%
+  full_join(test_sub3_weather) %>% 
+  filter(src_id != 1585 & src_id != 1588 & src_id != 1605 & src_id != 1609)
+
+test_joined_stations <- test_joined_weather %>%
+  select(src_id, Latitude, Longitude) %>%
+  distinct()
+
+test_joined_stations_sf <- st_as_sf(test_joined_stations, coords = c("Longitude", "Latitude"), crs = 4326, na.fail=F)
+
+test_selected_weather <- test_joined_weather %>%
+  select(OB_END_TIME, VERSION_NUM, src_id, CS_24HR_SUN_DUR, WMO_24HR_SUN_DUR, DRV_24HR_SUN_DUR, Latitude, Longitude)
+
+test_selected_weather <- test_selected_weather %>%
+  mutate(
+    SUNSHINE_DUR = case_when(
+      !is.na(CS_24HR_SUN_DUR) ~ CS_24HR_SUN_DUR,
+      is.na(WMO_24HR_SUN_DUR) & !is.na(DRV_24HR_SUN_DUR) ~ DRV_24HR_SUN_DUR,
+      is.na(DRV_24HR_SUN_DUR) & !is.na(WMO_24HR_SUN_DUR) ~ WMO_24HR_SUN_DUR,
+      !is.na(DRV_24HR_SUN_DUR) & !is.na(WMO_24HR_SUN_DUR) ~ 
+        (DRV_24HR_SUN_DUR + WMO_24HR_SUN_DUR) / 2,
+      TRUE ~ NA_real_ 
+    )
+  ) %>% 
+  select(!c(CS_24HR_SUN_DUR, WMO_24HR_SUN_DUR, DRV_24HR_SUN_DUR))
+
+test_min_date <- min(as.Date(test_selected_weather$OB_END_TIME))
+test_max_date <- max(as.Date(test_selected_weather$OB_END_TIME))
+test_all_dates <- expand.grid(
+  src_id = unique(test_selected_weather$src_id),
+  OB_DATE = seq(test_min_date, test_max_date, by = "day")
+)
+test_selected_weather <- test_selected_weather %>%
+  mutate(OB_DATE = as.Date(OB_END_TIME))
+
+test_missing_days <- test_all_dates %>%
+  anti_join(test_selected_weather %>% select(src_id, OB_DATE), by = c("src_id", "OB_DATE"))
+
+test_missing_days %>%
+  count(src_id, name = "missing_days") %>%
+  arrange(desc(missing_days))
+
+test_complete_stations <- test_joined_stations[!(test_joined_stations$src_id %in% test_missing_days$src_id),]
+test_complete_stations_sf <- st_as_sf(test_complete_stations,coords = c("Longitude", "Latitude"), crs = 4326, na.fail=F)
+
+tm_shape(uk) +
+  tm_polygons() +
+  tm_shape(test_joined_stations_sf) +
+  tm_dots(fill = "blue", size = 0.1) +
+  tm_shape(test_complete_stations_sf) +
+  tm_shape(test_complete_stations_sf) +
+  tm_dots(fill = "red", size = 0.2) 
+
+test_weather_sf <- st_as_sf(test_selected_weather, coords = c("Longitude", "Latitude"), crs = 4326, na.fail = F) 
+test_weather_sf <- st_transform(test_weather_sf, crs = st_crs(boundaries_with_capacity)) 
+test_weather_with_id <- st_join(test_weather_sf, boundaries_with_capacity[, c("ID")]) %>%
+  st_drop_geometry() %>%
+  na.omit() %>% #removes weather stations in the Ocean 
+  summarise(avg_sun = mean(SUNSHINE_DUR), .by=c(ID, OB_END_TIME)) #alternative is block kriging
+
+region_12_geom <- boundaries_with_capacity %>% filter(ID == 12)
+test_weather_sf$dist_to_region12 <- st_distance(test_weather_sf, st_centroid(region_12_geom)) %>% as.numeric()
+
+test_weather_near_12 <- test_weather_sf %>%
+  group_by(OB_END_TIME) %>%
+  arrange(dist_to_region12) %>%
+  slice_head(n = 4) %>% 
+  summarise(avg_sun = mean(SUNSHINE_DUR, na.rm = TRUE), .groups = "drop") %>%
+  mutate(ID = 12)  
+
+test_weather_near_12$ID <- as.character(test_weather_near_12$ID)
+test_weather <- bind_rows(test_weather_with_id, test_weather_near_12) %>%
+  mutate(date = as.Date(OB_END_TIME), .before = ID) %>%
+  arrange(date, ID) %>%
+  select(date,ID,avg_sun) %>%
+  setNames(c("date", "pes_id", "sun_duration"))
+
+test_weather <- bind_rows(test_weather_with_id, test_weather_near_12) %>%
+  mutate(date = as.Date(OB_END_TIME), .before = ID) %>%
+  arrange(date, ID) %>%
+  select(date, ID, avg_sun) %>%
+  setNames(c("date", "pes_id", "sun_duration"))
+
+test_gen_data <- read.csv("C:\\Users\\Utente\\Desktop\\Research\\data\\test_daily_pv_generation.csv", header = T, sep = ",")
+test_gen_data$pes_id <- as.character(test_gen_data$pes_id)
+test_gen_data$date <- as.Date(test_gen_data$date)
+
+test_data <- test_gen_data %>%
+  full_join(test_weather, by=c("pes_id", "date")) %>%
+  left_join(capacity_by_pes, by="pes_id") %>%
+  mutate(capacity_factor = energy_mwh/capacity_mwh) %>%
+  mutate(month = format(date, "%m")) #assuming no effect between years (probably there is though)
+test_data$month <- as.factor(test_data$month)
+```
+
+#### Notes: 
+- we can add more weather variables through same approach (finding stations with data of interest and average inside each region)
+- We are only accounting for months as temporal covariates, not days nor years.
+
+## EDA
+
+```{r eda}
+ggplot(data, aes(x = energy_mwh)) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  labs(title = "Histogram of Energy (MWh)", x = "Energy (MWh)", y = "Count")
+```
+##### Plot of target variable shows possible chi-squared distribution
+
+```{r eda_transf}
+ggplot(data, aes(x = log(energy_mwh))) +
+  geom_histogram(bins = 50, fill = "steelblue", color = "white") +
+  labs(title = "Histogram of Energy (MWh)", x = "Energy (MWh)", y = "Count")
+```
+##### Plot of transformed target variable: could maybe assume a normal.
+
+```{r eda1}
+ggplot(data, aes(x = seq_along(energy_mwh), y = energy_mwh, color = as.factor(pes_id))) +
+  geom_point(size = 0.5) +
+  labs(color = "PES ID", y = "Energy (MWh)", x = "Index")
+```
+##### Plot of energy generated per region. Shows clear differences based on region.
+```{r eda2}
+ggplot(data, aes(x = seq_along(sun_duration), y = sun_duration, color = as.factor(pes_id))) +
+  geom_point(size = 0.5) +
+  labs(color = "PES ID", y = "Sun Duration", x = "Index")
+```
+##### Plot of sunshine duration over the year 2024 for different regions. 
+```{r eda3}
+ggplot(data, aes(x = sun_duration, y = energy_mwh, color = as.factor(pes_id))) +
+  geom_point(size = 0.5) +
+  labs(color = "PES ID", x = "Sun Duration", y = "Energy (MWh)")
+```
+##### Plot of energy generated against sunshine duration. Shows correlation between energy output and weather conditions.
+
+## Modelling
+
+#### Our goal is to model daily energy generated in each of the 14 regions on their spatial location, average sun duration over the region, day of the year and capacity.
+
+### Generalized Linear Mixed Model (GLMM)
+
+#### We choose this model because:
+- the response variable energy_mwh is positive and skewed.
+- there are multiple regions (14 PES regions) which motivate random intercepts or even spatial random effects.
+- time-varying effects or trends can be modeled.
+- Region-level covariates (sun_duration, capacity) can be included as fixed effects.
+
+#### This model assumes the same distribution for each region, thus that the covariates correlate to the target variable in the same way throughout the different regions. This assumption may be weak as for instance sunshine duration has different effects in regions with different sun angles, and months in different regions mean different meteorological conditions.
+
+#### We will fit pairs of models: one assuming normality of the log-scaled data (Linear Mixed Effects Regression), and one assuming a gamma distribution (Generalized Linear Mixed Effects Regression).
+
+### **Models 1 and 2**
+
+#### Before fitting the models, we make one last change to our date variable, as we group the dates in months of observations  (daily data is too detailed and has too few observation for each date). Also, we standardize the variables because of too different scales.
+
+```{r month}
+data <- data %>%
+  mutate(month = format(date, "%m")) 
+  
+data$month <- as.factor(data$month)
+
+rescaled_data <- data %>%
+  mutate(
+    sun_duration = scale(sun_duration),
+    capacity_mwh = scale(capacity_mwh)
+    )
+
+rescaled_test_data <- test_data %>%
+  mutate(
+    sun_duration = scale(sun_duration),
+    capacity_mwh = scale(capacity_mwh)
+    )
+
+head(rescaled_data)
+```
+
+```{r model1}
+model1 <- lmer(
+  log(energy_mwh) ~ sun_duration + capacity_mwh + 
+    month +      
+    (1 | pes_id),                    
+  data = rescaled_data
+)
+
+model2 <- glmer(
+  energy_mwh ~ sun_duration + capacity_mwh + 
+    month +      
+    (1 | pes_id),                    
+  data = rescaled_data,
+  family = Gamma(link = "log")
+)
+```
+
+```{r summarym1}
+summary(model1)
+coef(model1)
+paste("AIC: ", AIC_model1 <- extractAIC(model1)[2])
+
+rescaled_test_data$predicted_energy_1 <- exp(predict(
+  model1,
+  newdata = rescaled_test_data,
+  type = "response",         
+  allow.new.levels = FALSE   
+))
+
+summary(model2)
+coef(model2)
+paste("AIC: ", AIC_model2 <- extractAIC(model2)[2])
+
+rescaled_test_data$predicted_energy_2 <- predict(
+  model2,
+  newdata = rescaled_test_data,
+  type = "response",         
+  allow.new.levels = FALSE   
+)
+```
+```{r metrics2}
+rmse_score_1 <- rmse(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_1)
+mae_score_1 <- mae(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_1)
+
+cat("Model 1 -> RMSE:", rmse_score_1, "\nMAE:", mae_score_1, "\n")
+
+rmse_score_2 <- rmse(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_2)
+mae_score_2 <- mae(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_2)
+
+cat("Model 2 -> RMSE:", rmse_score_2, "\nMAE:", mae_score_2)
+
+ggplot(rescaled_test_data, aes(x = energy_mwh, y = predicted_energy_1, color = as.factor(pes_id))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "Model 1: Predicted vs Observed Energy Generation",
+       x = "Log of Observed energy_mwh",
+       y = "Log of Predicted energy_mwh",
+       color = "PES ID") +
+  theme_minimal()
+
+ggplot(rescaled_test_data, aes(x = energy_mwh, y = predicted_energy_2, color = as.factor(pes_id))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "Model 2: Predicted vs Observed Energy Generation",
+       x = "Observed energy_mwh",
+       y = "Predicted energy_mwh",
+       color = "PES ID") +
+  theme_minimal()
+
+```
+
+### In model 1, we assume a normal distribution of the log-transformed data and fit a linear mixed effects model. In model 2, on the other hand, we assume a gamma distribution of the original data and fit a generalized linear mixed effects model.
+
+#### So, in model 1 and 2, we assume a random intercept for the different pes regions, and constant effects of time, sun duration, and capacity factor on all the regions. This could not be the right assumption as from our plot we have seen curves for energy generated have different shapes over time for different regions, suggesting different effects of the covariates on different regions. 
+
+#### Our model's coefficients are all statistically significant (except for November month, which could be have very similar values to the baseline January and thus have small coefficient). As we observe the interecepts, we notice that smaller intercepts are for regions with lower solar power generation (i.e. regions 12, 17 and 18). We observe that for large observations model 1 and 2 tend to overestimate, for every region in the same manner. Also, we look at the coefficients magnitudes and directions and they all make practical sense. The coefficients differ minimally between model 1 and 2. Their interpretation, however, is to me *unclear*.
+
+### We notice that MSAE and RMSE are smaller for model 2, implying better predictive performance, but the *AIC is insanely larger* (overcomplexity or wrong model?).
+
+### We try to add a lag variable (previous day of observation as a predictor) and then refit the models. 
+
+```{r lag}
+rescaled_data <- rescaled_data %>%
+  arrange(date) %>%              
+  group_by(pes_id) %>%
+  mutate(lag_energy_mwh = scale(lag(energy_mwh))) %>%   
+  ungroup() %>%
+  na.omit()
+
+rescaled_test_data <- rescaled_test_data %>%
+  arrange(date) %>%              
+  group_by(pes_id) %>%
+  mutate(lag_energy_mwh = scale(lag(energy_mwh))) %>%   
+  ungroup() %>%
+  na.omit()
+```
+
+```{r pl_lag}
+plot(rescaled_data$lag_energy_mwh, rescaled_data$energy_mwh)
+```
+
+##### Plot of energy vs lag: when lag is negative (less energy generated than previous day), the energy levels are low. When positive, the energy levels get higher and higher.
+
+```{r lagvsenergy}
+model_lag <- lm(lag_energy_mwh~scale(energy_mwh), data=rescaled_data)
+summary(model_lag)
+```
+#### This result confirms our positive correlation hypothesis between the two variables.
+
+#### Now we fit same models but with added variable (lag).
+
+### **Models 3 and 4**
+
+### Model 3 is model 1 with standardized lag, sun duration and capacity. Model 4 is model 2 with standardized lag, sun duration and capacity.
+
+```{r lag2}
+model3 <- lmer(
+  log(energy_mwh) ~ sun_duration + capacity_mwh + 
+    month + lag_energy_mwh +      
+    (1 | pes_id),                    
+  data = rescaled_data
+)
+
+model4 <- glmer(
+  energy_mwh ~ sun_duration + capacity_mwh + 
+    month + lag_energy_mwh +    
+    (1 | pes_id),                    
+  data = rescaled_data,
+  family = Gamma(link = "log")
+)
+```
+
+```{r diag34}
+summary(model3)
+paste("AIC: ", AIC_model3 <- extractAIC(model3)[2])
+
+rescaled_test_data$predicted_energy_3 <- exp(predict(
+  model3,
+  newdata = rescaled_test_data,
+  type = "response",         
+  allow.new.levels = F   
+))
+
+summary(model4)
+paste("AIC: ", AIC_model4 <- extractAIC(model4)[2])
+
+rescaled_test_data$predicted_energy_4 <- predict(
+  model4,
+  newdata = rescaled_test_data,
+  type = "response",         
+  allow.new.levels = FALSE   
+)
+```
+
+```{r metrics}
+rmse_score_3 <- rmse(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_3)
+mae_score_3 <- mae(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_3)
+
+cat("Model 3 -> RMSE:", rmse_score_3, "\nMAE:", mae_score_3, "\n")
+
+rmse_score_4 <- rmse(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_4)
+mae_score_4 <- mae(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_4)
+
+cat("Model 4 -> RMSE:", rmse_score_4, "\nMAE:", mae_score_4)
+
+ggplot(rescaled_test_data, aes(x = energy_mwh, y = predicted_energy_3, color = as.factor(pes_id))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "Model 3: Predicted vs Observed Energy Generation",
+       x = "Log of Observed energy_mwh",
+       y = "Log of Predicted energy_mwh",
+       color = "PES ID") +
+  theme_minimal()
+
+ggplot(rescaled_test_data, aes(x = energy_mwh, y = predicted_energy_4, color = as.factor(pes_id))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "Model 4: Predicted vs Observed Energy Generation",
+       x = "Observed energy_mwh",
+       y = "Predicted energy_mwh",
+       color = "PES ID") +
+  theme_minimal()
+```
+
+#### Lag has a significant effect on the target variable (p value < 5%). However, the estimate's magnitude is very small.
+
+### Model 3 and model 4 have larger AICs than model 1 and model 2 respectively (more complexity not resulting in better predictions). 
+
+### As far as MSAE and RMSE are concerned, model 1 and 2 perform better than model 3 and 4, respectively. We again notice a better RMSE for the linear models (they probably make better predictions on the overestimated values), and a better MSE for the generalized models (they capture better the distribution for non-outliers).
+
+### An idea is that the generated power could have more correlation with the average of the last week of observation which is less prone to randomness. So we try to add this variable to the model
+
+```{r weeks}
+rescaled_data <- rescaled_data %>%
+  arrange(as.Date(date, format = "%Y-%m-%d")) %>%
+  group_by(pes_id) %>%
+  mutate(
+    weekly_avg_energy_mwh = lag(
+      rollapply(
+        data = energy_mwh,
+        width = 7,
+        FUN = mean,
+        align = "right",
+        fill = "extend"
+      ),
+      n = 1
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(weekly_avg_energy_mwh=scale(weekly_avg_energy_mwh)) %>%
+  na.omit()
+```
+```{r resctest, include=F,echo=F}
+rescaled_test_data <- rescaled_test_data %>%
+  arrange(pes_id, as.Date(date, format = "%Y-%m-%d")) %>%
+  group_by(pes_id) %>%
+  mutate(
+    weekly_avg_energy_mwh = rollapply(
+      data = energy_mwh,
+      width = 7,
+      FUN = mean,
+      align = "right",
+      fill = "extend"
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(weekly_avg_energy_mwh=scale(weekly_avg_energy_mwh)) %>%
+  na.omit()
+
+rescaled_data <- rescaled_data %>%
+  arrange(as.Date(date, format = "%Y-%m-%d")) %>%
+  group_by(pes_id) %>%
+  mutate(
+    three_days_avg_energy_mwh = lag(
+      rollapply(
+        data = energy_mwh,
+        width = 3,
+        FUN = mean,
+        align = "right",
+        fill = "extend"
+      ),
+      n = 1
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(three_days_avg_energy_mwh=scale(three_days_avg_energy_mwh)) %>%
+  na.omit()
+
+rescaled_test_data <- rescaled_test_data %>%
+  arrange(as.Date(date, format = "%Y-%m-%d")) %>%
+  group_by(pes_id) %>%
+  mutate(
+    three_days_avg_energy_mwh = lag(
+      rollapply(
+        data = energy_mwh,
+        width = 3,
+        FUN = mean,
+        align = "right",
+        fill = "extend"
+      ),
+      n = 1
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(three_days_avg_energy_mwh=scale(three_days_avg_energy_mwh)) %>%
+  na.omit()
+```
+
+#### Lets try fitting model 5 and 6 as before with this additional predictor.
+
+```{r model567}
+model5 <- lmer(
+  log(energy_mwh) ~ sun_duration + capacity_mwh + 
+    month + weekly_avg_energy_mwh +      
+    (1 | pes_id),                    
+  data = rescaled_data
+)
+
+model6 <- glmer(
+  energy_mwh ~ sun_duration + capacity_mwh +
+    month + weekly_avg_energy_mwh +      
+    (1 | pes_id),
+    data = rescaled_data,
+  family = Gamma(link = "log")
+)
+```
+
+#### We suspect multicollinearity with these new variables, so we check it.
+
+```{r multico}
+cor(rescaled_data %>% 
+      select(sun_duration, capacity_mwh, weekly_avg_energy_mwh, lag_energy_mwh, three_days_avg_energy_mwh), use = "complete.obs")
+vif(lm(energy_mwh ~ sun_duration + capacity_mwh + month + three_days_avg_energy_mwh, 
+       data = rescaled_data))
+vif(lm(energy_mwh ~ sun_duration + capacity_mwh + month + weekly_avg_energy_mwh, 
+       data = rescaled_data))
+```
+
+#### VIFs are in a reasonable range. We notice that capacity is higly correlated with the weekly and three-days average, while 1 day lag has smaller correlation with the other variables. 3 days average has better vifs so we choose to keep this in our model.
+
+```{r model5679}
+model56 <- lmer(
+  log(energy_mwh) ~ sun_duration + capacity_mwh + 
+    month + three_days_avg_energy_mwh +      
+    (1 | pes_id),                    
+  data = rescaled_data
+)
+
+model67 <- glmer(
+  energy_mwh ~ sun_duration + capacity_mwh +
+    month + three_days_avg_energy_mwh +      
+    (1 | pes_id),
+    data = rescaled_data,
+  family = Gamma(link = "log")
+)
+```
+```{r diag567}
+summary(model5)
+paste("AIC: ", AIC_model5 <- extractAIC(model5)[2])
+
+rescaled_test_data$predicted_energy_5 <- exp(predict(
+  model5,
+  newdata = rescaled_test_data,
+  type = "response",         
+  allow.new.levels = F   
+))
+
+summary(model6)
+paste("AIC: ", AIC_model6 <- extractAIC(model6)[2])
+
+rescaled_test_data$predicted_energy_6 <- predict(
+  model6,
+  newdata = rescaled_test_data,
+  type = "response",         
+  allow.new.levels = FALSE   
+)
+
+summary(model56)
+paste("AIC: ", AIC_model56 <- extractAIC(model56)[2])
+
+rescaled_test_data$predicted_energy_56 <- exp(predict(
+  model56,
+  newdata = rescaled_test_data,
+  type = "response",         
+  allow.new.levels = F   
+))
+
+summary(model67)
+paste("AIC: ", AIC_model67 <- extractAIC(model67)[2])
+
+rescaled_test_data$predicted_energy_67 <- predict(
+  model67,
+  newdata = rescaled_test_data,
+  type = "response",         
+  allow.new.levels = FALSE   
+)
+```
+#### We see a slightly better improvement in the AIC and the predictor has a smaller p-value. 
+
+```{r diag56}
+rmse_score_5 <- rmse(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_5)
+mae_score_5 <- mae(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_5)
+
+cat("Model 5 -> RMSE:", rmse_score_5, "\nMAE:", mae_score_5, "\n")
+
+rmse_score_6 <- rmse(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_6)
+mae_score_6 <- mae(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_6)
+
+cat("Model 6 -> RMSE:", rmse_score_6, "\nMAE:", mae_score_6)
+
+ggplot(rescaled_test_data, aes(x = energy_mwh, y = predicted_energy_5, color = as.factor(pes_id))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "Model 6: Predicted vs Observed Energy Generation",
+       x = "Log of Observed energy_mwh",
+       y = "Log of Predicted energy_mwh",
+       color = "PES ID") +
+  theme_minimal()
+
+ggplot(rescaled_test_data, aes(x = energy_mwh, y = predicted_energy_6, color = as.factor(pes_id))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "Model 6: Predicted vs Observed Energy Generation",
+       x = "Observed energy_mwh",
+       y = "Predicted energy_mwh",
+       color = "PES ID") +
+  theme_minimal()
+
+rmse_score_56 <- rmse(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_56)
+mae_score_56 <- mae(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_56)
+
+cat("Model 56 -> RMSE:", rmse_score_56, "\nMAE:", mae_score_56, "\n")
+
+rmse_score_67 <- rmse(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_67)
+mae_score_67 <- mae(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_67)
+
+cat("Model 67 -> RMSE:", rmse_score_67, "\nMAE:", mae_score_67)
+
+ggplot(rescaled_test_data, aes(x = energy_mwh, y = predicted_energy_56, color = as.factor(pes_id))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "Model 56: Predicted vs Observed Energy Generation",
+       x = "Log of Observed energy_mwh",
+       y = "Log of Predicted energy_mwh",
+       color = "PES ID") +
+  theme_minimal()
+
+ggplot(rescaled_test_data, aes(x = energy_mwh, y = predicted_energy_67, color = as.factor(pes_id))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "Model 67: Predicted vs Observed Energy Generation",
+       x = "Observed energy_mwh",
+       y = "Predicted energy_mwh",
+       color = "PES ID") +
+  theme_minimal()
+```
+
+#### Model 5 and model 6 improve the metrics on the test data compared to the previous models 1, 2, 3 and 4. Model 6 has lower MAE but higher RMSE, suggesting that it performs better overall but performs poorly on bad predictions (though look at AIC). However, it still does not solve our overestimation problem for large observations.
+
+#### We choose model 67 as a baseline for further analysis, as the variables are less correlated.
+
+### *We notice that models with more correlated variables (not satisfying assumptions) perform better on test data. Do we prioritize assumptions or predictions?*
+
+### *When we fit the models with weekly average and three day average, the correlation decreases. In the estimates, we notice that the pvalues increase slightly for the capacity and decrease for the average, as if them being less correlated allows the model to understand that the three day average actually has more of an effect which is taken away from the capacity.*
+
+## Fitting models for every region.
+
+#### *We have to get rid of capacity_mwh as it is constant for every row. Is there a way to encode this data in the model?* Lagged capacity factor?
+
+#### Regionalized EDA
+
+```{r regionalizededa, fig.height=20}
+par(mfrow = c(7,2))
+for (pes in 10:23){
+  hist(rescaled_data %>% filter(pes_id==as.character(pes)) %>% pull(energy_mwh), breaks=30, col="blue", main=paste("Generated energy in region", pes))
+}
+
+par(mfrow = c(7,2))
+for (pes in 10:23){
+  hist(log(rescaled_data %>% filter(pes_id==as.character(pes)) %>% pull(energy_mwh)), breaks=30, col="red", main=paste("Log of generated energy in region", pes))
+}
+
+par(mfrow = c(7, 2))
+
+for (pes in 10:23) {
+  region_data <- rescaled_data %>% filter(pes_id == as.character(pes))
+  y <- region_data$energy_mwh
+  
+  y <- y + 1e-3
+  
+  bc <- boxcox(y ~ 1, lambda = seq(-2, 2, 0.1), plotit=F)  
+  best_lambda <- bc$x[which.max(bc$y)]
+  
+  if (abs(best_lambda) < 1e-3) {
+    y_transformed <- log(y)
+  } else {
+    y_transformed <- (y^best_lambda - 1) / best_lambda
+  }
+
+  hist(
+    y_transformed,
+    breaks = 30,
+    col = "purple",
+    main = paste("Box-Cox (λ=", round(best_lambda, 2), ") Region", pes),
+    xlab = "Transformed energy"
+  )
+}
+```
+#### The distributions in each region are similar. They have a spike on the left followed by a decrease, which shows different minor spikes.
+
+#### The log-transformed distributions have the same behavior, in the opposite direction. It does not look 'normal' enough.
+
+#### When using the box-cox transformation, it gets better but we are still far from a normal distribution in some plots (*how does it depend on breaks and how do we choose right breaks?*)
+
+```{r regionalized}
+region_data_list <- split(rescaled_data, rescaled_data$pes_id)
+test_region_data_list <- split(rescaled_test_data, rescaled_test_data$pes_id)
+
+fit_region_model_gamma <- function(region_df) {
+  tryCatch({
+    model <- glm(
+      energy_mwh ~ sun_duration + 
+        month + three_days_avg_energy_mwh,
+      data = region_df,
+      family = Gamma(link = "log")
+    )
+  }, error = function(e) {
+    message("Model failed for region: ", unique(region_df$pes_id))
+    return(NULL)
+  })
+}
+
+fit_region_model_normal <- function(region_df) {
+  tryCatch({
+    model <- lm(
+      log(energy_mwh) ~ sun_duration + 
+        month + three_days_avg_energy_mwh,
+      data = region_df
+      )
+  }, error = function(e) {
+    message("Model failed for region: ", unique(region_df$pes_id))
+    return(NULL)
+  })
+}
+
+region_models_normal <- map(region_data_list, fit_region_model_normal)
+region_models_gamma <- map(region_data_list, fit_region_model_gamma)
+```
+
+#### Now we compute statistics and compare plots of predicted vs observed for each region.
+
+```{r moremods, echo=F}
+compute_predictions_metrics_normal <- function(pes_id, model, test_df) {
+  if (is.null(model) || nrow(test_df) == 0) return(NULL)
+  
+  test_df$regional_predicted_energy <- exp(predict(model, newdata = test_df, type = "response"))
+
+  rmse_val <- rmse(test_df$energy_mwh, test_df$regional_predicted_energy)
+  mae_val <- mae(test_df$energy_mwh, test_df$regional_predicted_energy)
+  
+  test_df$pes_id <- pes_id  
+  
+  list(data = test_df, metrics = data.frame(pes_id = pes_id, RMSE = rmse_val, MAE = mae_val))
+}
+
+compute_predictions_metrics_gamma <- function(pes_id, model, test_df) {
+  if (is.null(model) || nrow(test_df) == 0) return(NULL)
+  
+  test_df$regional_predicted_energy <- predict(model, newdata = test_df, type = "response")
+  
+  rmse_val <- rmse(test_df$energy_mwh, test_df$regional_predicted_energy)
+  mae_val <- mae(test_df$energy_mwh, test_df$regional_predicted_energy)
+  
+  test_df$pes_id <- pes_id  
+  
+  list(data = test_df, metrics = data.frame(pes_id = pes_id, RMSE = rmse_val, MAE = mae_val))
+}
+
+results_normal <- Map(compute_predictions_metrics_normal,
+               names(region_models_normal),
+               region_models_normal,
+               test_region_data_list)
+
+results_gamma <- Map(compute_predictions_metrics_gamma,
+               names(region_models_gamma),
+               region_models_gamma,
+               test_region_data_list)
+
+predicted_all <- bind_cols(bind_rows(lapply(results_normal, `[[`, "data")),bind_rows(lapply(results_gamma, `[[`, "data")), )[,c(1:3,19,38)]
+metrics_all <- bind_cols(bind_rows(lapply(results_normal, `[[`, "metrics")),bind_rows(lapply(results_gamma, `[[`, "metrics")))
+```
+#### Results on the left are lmer models, results on the right the glmr models. Not for all regions model choice is straighforward: some regions see better performances on their GLM, while others prefer a LM. This suggests that our model should be more flexible when working with all regions together and that a unique assumption may not be the best.
+#### Once again, we notice that the generalized models in some regions have better mae and worse rmse compared to the respective linear model.
+
+### *why does model assuming normality of not transformed target variable have best metrics? The assumptions of the model do not hold!*
+
+```{r reg_vs_mod6}
+metrics_all
+
+(mae_reg_lin <- mean(metrics_all$MAE...3))
+(mae_reg_glm <- mean(metrics_all$MAE...6))
+
+(rmse_reg_lin <- mean(metrics_all$RMSE...2))
+(rmse_reg_glm <- mean(metrics_all$RMSE...5))
+```
+#### This shows that using the group of regional models can improve our predictions compared to model67, as the mae remains steady and the rmse decreases by about 20%, meaning our combined models makes better predictions on very large regional values. *is averaging the rmse's good practice?*
+
+```{r plolplo}
+ggplot(predicted_all, aes(x = energy_mwh...3, y = regional_predicted_energy...19, color = as.factor(pes_id...2))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "Linear Regression: Predicted vs Observed Energy Generation",
+       x = "Observed energy_mwh",
+       y = "Predicted energy_mwh",
+       color = "PES ID") +
+  theme_minimal()
+
+ggplot(predicted_all, aes(x = energy_mwh...3, y = regional_predicted_energy...38, color = as.factor(pes_id...2))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "Generalized Regression: Predicted vs Observed Energy Generation",
+       x = "Observed energy_mwh",
+       y = "Predicted energy_mwh",
+       color = "PES ID") +
+  theme_minimal()
+```
+### Coefficients and residual plot
+
+```{r summary_lm}
+reg_coefficients <- data.frame(cbind(region_models_normal$`10`$coefficients, region_models_normal$`11`$coefficients, region_models_normal$`12`$coefficients, region_models_normal$`13`$coefficients, region_models_normal$`14`$coefficients, region_models_normal$`15`$coefficients, region_models_normal$`16`$coefficients, region_models_normal$`17`$coefficients, region_models_normal$`18`$coefficients, region_models_normal$`19`$coefficients, region_models_normal$`20`$coefficients, region_models_normal$`21`$coefficients, region_models_normal$`22`$coefficients, region_models_normal$`23`$coefficients))
+colnames(reg_coefficients) <- paste("Region ", 10:23)
+reg_coefficients
+```
+
+#### By looking at the coefficients for the 14 regions, we notice that those for sun duration vary but there is no clear pattern given by position of the region on the map. On the other hand, we notice that the coefficients for 'month' get higher values for northern regions of the UK: 15, 16, 17, 18. The coefficients associated to summer months are significantly greater for these regions than for the others. Since the baseline category is january, this means that in northern regions, the increase of energy produced in the summer compared to that produced in january is greater than the increase in other regions. This tells us that location does indeed have an effect and that is highly correlated to the time of the year.  
+
+#### While the three day average lag is significant in model67, it is not significant in the regional models. We also notice that it takes different directions for the different regions, which makes us doubtful about its effect. 
+
+```{r reg_plots}
+for (pes in 10:23){
+  predictions <- exp(predict(region_models_normal[[as.character(pes)]], newdata = filter(rescaled_test_data, pes_id==pes)))
+  residuals <- pull(filter(rescaled_test_data, pes_id==pes),energy_mwh) - predictions
+  plot_df <- data.frame(predictions = predictions, residuals = residuals)
+  p <- ggplot(plot_df, aes(x = predictions, y = residuals)) +
+    geom_point(alpha = 0.6) +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    labs(title = paste("Residual Plot for region ", pes),
+         x = "Predicted energy_mwh",
+         y = "Residuals (Observed - Predicted)") +
+    theme_minimal()
+  print(p)
+}
+```
+
+#### When we look at these graphs, we see once again that our models overestimate the actual value after a certain point. What is interesting (yet has no explanaition I could think about) is that after 1/3 of the range of values predicted, the values start to be overestimated, in a similar way, for all regions. This means that we are missing something in our model that is not restricted to the complete model case, but is missing in every single region's data.
+
+### Adding interaction between sun_duration and month in the model with all the regions to see if it captures the differences arisen in the regional models, and probably due to sun inclination differences throughout the region.
+
+```{r interactions}
+model67_interacted <- glmer(
+  energy_mwh ~ sun_duration*month + capacity_mwh +       
+    (1 | pes_id),
+    data = rescaled_data,
+  family = Gamma(link = "log")
+)
+
+summary(model67_interacted)
+paste("AIC: ", AIC_model67_interacted <- extractAIC(model67_interacted)[2])
+
+rescaled_test_data$predicted_energy_67_interacted <- predict(
+  model67_interacted,
+  newdata = rescaled_test_data,
+  type = "response",         
+  allow.new.levels = FALSE   
+)
+
+rmse_score_67_interacted <- rmse(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_67_interacted)
+mae_score_67_interacted <- mae(rescaled_test_data$energy_mwh, rescaled_test_data$predicted_energy_67_interacted)
+
+cat("Model 67_interacted -> RMSE:", rmse_score_67_interacted, "\nMAE:", mae_score_67_interacted)
+
+ggplot(rescaled_test_data, aes(x = energy_mwh, y = predicted_energy_67_interacted, color = as.factor(pes_id))) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(title = "Model 67_interacted: Predicted vs Observed Energy Generation",
+       x = "Observed energy_mwh",
+       y = "Predicted energy_mwh",
+       color = "PES ID") +
+  theme_minimal()
+
+residuals_67_interacted <- pull(rescaled_test_data, energy_mwh) - pull(rescaled_test_data, predicted_energy_67_interacted)
+
+plot_df <- data.frame(predictions = pull(rescaled_test_data, predicted_energy_67_interacted), residuals = residuals_67_interacted, pes_id = pull(rescaled_test_data, pes_id)) %>%
+  mutate(area = ifelse(pes_id %in% c(15,16,17,18), "North", "South"))
+
+ggplot(plot_df, aes(x = predictions, y = residuals)) +
+  geom_point(aes(color = area), alpha = 0.6) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  facet_wrap(~ area) +
+  labs(
+    title = "Residual Plot by Region Area",
+    x = "Predicted energy_mwh",
+    y = "Residuals (Observed - Predicted)"
+  ) +
+  theme_minimal()
+
+```
+
+#### The model with the interaction coefficients (one for the interaction between each month and sun duration) performs significantly better than the previous ones. The MAE decreased by 37% and the RMSE decreased by 52%. Also the AIC has decreased significantly, though we have added a total of 11 new parameters (almost doubled them). Finally, we observe from the plot how the overestimation issue is noticeably diminished, though a some reduced overestimation still appears, in the same way for northern and southern regions, for relatively high valued predictions. We also get rid of the three day average in the new model as a first fit shows a p-value of .77.
+
+#### *how to interpret interaction parameters?*
+
+
+## Accounting for spatio-temporal correlation.
+
+#### Some possible modelling techniques to account for spatial and temporal autocorrelation (since now we categorized the two dimensions) are:
+- spatio-Temporal Kriging.
+- Spatio-Temporal Mixed Models (STMMs) - this model is good for irregular region boundaries and accounts for adjacency. It assumes a normal distribution of random effects and requires attention in covariance function definition.
+- GAMMs (Generalized Additive Mixed Models) - captures non-linear relationships without defining a covariance matrix. It is better for coordinates than discretized locations.
+
+#### We start by fitting a spatio-temporal kriging model: this model assumes separability (no space-time interaction) and isotropy (no directional effect but just distance effect). Of course, these assumptions probably do not hold in our data, but we still fit the model to understand something more about the data. The Kriging method minimizes the error of prediction in order to obtain weights of prediction (theoretically, we assume that observations closer in space and time have a larger effect on the predicted value). The resulting predictor is a function of the covariances between the prediction point and all other points in space and time. For this to work, we must assume a covariance function.
+
+#### The first step is to compute and add to our data centroids for our regions as we use the distance between them in our model.
+
+```{r krig}
+boundaries_centroids <- boundaries %>%
+  st_centroid()
+centroid_coords <- st_coordinates(boundaries_centroids)
+region_coords <- boundaries_centroids %>%
+  st_drop_geometry() %>%
+  mutate(x = centroid_coords[, 1],
+         y = centroid_coords[, 2]) %>%
+  select(ID, x, y)
+
+rescaled_data <- rescaled_data %>%
+  left_join(region_coords, by = c("pes_id" = "ID"))
+```
+
+#### Now we follow gstat's guidelines by creating a spatio temporal dataset before fitting.
+
+```{r krig2}
+spatial_pts <- SpatialPoints(rescaled_data[, c("x", "y")],
+                             proj4string = CRS(SRS_string = "EPSG:27700")
+) 
+rescaled_data$date <- as.Date(rescaled_data$date)
+
+stidf <- STIDF(
+  sp = spatial_pts,
+  time = rescaled_data$date,  
+  data = rescaled_data[, c("energy_mwh", "sun_duration", "capacity_mwh")]
+)
+
+(stidf)
+```
+
+#### We now compute the sample spatiotemporal variogram.
+
+```{r var}
+variog_formula <- energy_mwh ~ sun_duration + capacity_mwh
+
+vgm_sample <- variogramST(
+  formula = variog_formula,
+  data = stidf,
+  assumeRegular = FALSE,  #since points are spaced irregularly
+  na.omit = TRUE
+)
+
+plot(vgm_sample, wireframe = TRUE, all = TRUE, col.regions = terrain.colors(100))
+```
+
+
+
