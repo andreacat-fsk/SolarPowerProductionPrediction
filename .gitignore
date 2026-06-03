@@ -1,0 +1,26 @@
+# Python virtual environments
+venv/
+.venv/
+**/.venv/
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# R files and temporary outputs
+*.Rhistory
+*.RData
+*.RDataTmp
+.Rproj.user/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Ignore local data directories (keep data locally)
+"Daily model on pes regions"/Data/
+"Hourly model on gsps"/Data_hour/
