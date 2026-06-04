@@ -1,1 +1,18 @@
+# Data acquisition
 pvlive-api
+
+# Data processing
+pandas
+numpy
+scikit-learn
+
+# Deep learning
+tensorflow
+torch
+
+# Visualisation
+matplotlib
+plotnine
+
+# Utilities
+joblib
