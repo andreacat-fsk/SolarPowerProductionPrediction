@@ -161,7 +161,6 @@ python models/hourly_lstm/lstm_weather_fusion.py data_for_lstm.feather --gsp-id 
 - **Larger training data** — Use the full 19M row dataset to reduce overfitting
 
 This repository represents my academic thesis research. For this scope, models were trained on a localized subset of 50,000 rows representing a single GSP to establish architectural viability. The LSTM performance highlighted the limitations of isolated time-series forecasting.
-
 Ideally, I would have utilized the full 20-million row dataset, pivoting away from isolated LSTMs and implementing a Spatio-Temporal Graph Neural Network (STGNN) to capture the spatial movement of weather covariates across the grid. However, I could only use a subset of the training data I built due to hardware constraints. 
 ---
 
